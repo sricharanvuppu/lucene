@@ -145,6 +145,39 @@ public abstract class DirectoryReader extends BaseCompositeReader<LeafReader> {
   }
 
   /**
+   * Expert: Returns a IndexReader reading all committed and uncommitted changes
+   * from the IndexWriter. Segment readers are opened in parallel using the
+   * provided ExecutorService.
+   *
+   * @param writer the IndexWriter to open from
+   * @param executorService used to open segment readers in parallel; if null, sequential
+   * @throws IOException if there is a low-level IO error
+   * @lucene.experimental
+   */
+  public static DirectoryReader open(IndexWriter writer, ExecutorService executorService)
+      throws IOException {
+    return writer.getReader(true, false, executorService);
+  }
+
+  /**
+   * Expert: Returns a IndexReader reading all committed and uncommitted changes
+   * from the IndexWriter. Segment readers are opened in parallel using the
+   * provided ExecutorService.
+   *
+   * @param writer the IndexWriter to open from
+   * @param applyAllDeletes if true, all buffered deletes will be applied
+   * @param writeAllDeletes if true, new deletes will be written to disk
+   * @param executorService used to open segment readers in parallel; if null, sequential
+   * @throws IOException if there is a low-level IO error
+   * @lucene.experimental
+   */
+  public static DirectoryReader open(
+      IndexWriter writer, boolean applyAllDeletes, boolean writeAllDeletes,
+      ExecutorService executorService) throws IOException {
+    return writer.getReader(applyAllDeletes, writeAllDeletes, executorService);
+  }
+
+  /**
    * Expert: returns an IndexReader reading the index in the given {@link IndexCommit}.
    *
    * @param commit the commit point to open

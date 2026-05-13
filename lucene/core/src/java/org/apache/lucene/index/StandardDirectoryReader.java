@@ -165,6 +165,114 @@ public final class StandardDirectoryReader extends DirectoryReader {
     }
   }
 
+
+  /**
+   * Open from IndexWriter with parallel segment reader initialization.
+   * Creates segment readers concurrently using the provided ExecutorService.
+   * Each segment reader is obtained from the IndexWriter's reader pool.
+   *
+   * <p>Must be called while holding the IndexWriter monitor lock (synchronized(writer)).
+   * getPooledInstance() is called on the main thread (holds lock). The expensive
+   * getReadOnlyClone() I/O is submitted to the executor. release() is called on the
+   * main thread after all futures complete (satisfies lock assertion).
+   */
+  static StandardDirectoryReader open(
+      IndexWriter writer,
+      SegmentInfos infos,
+      boolean applyAllDeletes,
+      boolean writeAllDeletes,
+      ExecutorService executor) throws IOException {
+
+    final int numSegments = infos.size();
+    final Directory dir = writer.getDirectory();
+    final SegmentInfos segmentInfos = infos.clone();
+
+    // Phase 1: Get pooled instances on main thread (holds writer lock)
+    final ReadersAndUpdates[] rlds = new ReadersAndUpdates[numSegments];
+    for (int i = 0; i < numSegments; i++) {
+      final SegmentCommitInfo info = infos.info(i);
+      assert info.info.dir == dir;
+      rlds[i] = writer.getPooledInstance(info, true);
+    }
+
+    // Phase 2: Submit expensive getReadOnlyClone() to executor in parallel
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    final Future<SegmentReader>[] futures = new Future[numSegments];
+    for (int i = 0; i < numSegments; i++) {
+      final ReadersAndUpdates rld = rlds[i];
+      futures[i] = executor.submit(() -> rld.getReadOnlyClone(IOContext.DEFAULT));
+    }
+
+    // Phase 3: Collect results
+    final SegmentReader[] readers = new SegmentReader[numSegments];
+    RuntimeException firstException = null;
+    for (int i = 0; i < numSegments; i++) {
+      try {
+        readers[i] = futures[i].get();
+      } catch (ExecutionException e) {
+        if (firstException == null) {
+          firstException = new RuntimeException(e.getCause());
+        } else {
+          firstException.addSuppressed(e.getCause());
+        }
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        if (firstException == null) {
+          firstException = new RuntimeException(e);
+        }
+      }
+    }
+
+    // Phase 4: Release all ReadersAndUpdates on main thread (holds writer lock)
+    for (int i = 0; i < numSegments; i++) {
+      if (rlds[i] != null) {
+        writer.release(rlds[i]);
+      }
+    }
+
+    // Handle errors
+    if (firstException != null) {
+      for (SegmentReader reader : readers) {
+        if (reader != null) {
+          try {
+            reader.decRef();
+          } catch (Throwable t) {
+            firstException.addSuppressed(t);
+          }
+        }
+      }
+      if (firstException.getCause() instanceof IOException) {
+        throw (IOException) firstException.getCause();
+      }
+      throw firstException;
+    }
+
+    // Phase 5: Filter fully-deleted segments (same as sequential path)
+    final List<SegmentReader> validReaders = new ArrayList<>(numSegments);
+    int infosUpto = 0;
+    for (int i = 0; i < numSegments; i++) {
+      final SegmentReader reader = readers[i];
+      if (reader.numDocs() > 0
+          || writer.getConfig().mergePolicy.keepFullyDeletedSegment(() -> reader)) {
+        validReaders.add(reader);
+        infosUpto++;
+      } else {
+        reader.decRef();
+        segmentInfos.remove(infosUpto);
+      }
+    }
+
+    writer.incRefDeleter(segmentInfos);
+
+    return new StandardDirectoryReader(
+        dir,
+        validReaders.toArray(new SegmentReader[0]),
+        writer,
+        segmentInfos,
+        writer.getConfig().getLeafSorter(),
+        applyAllDeletes,
+        writeAllDeletes);
+  }
   /**
    * This constructor is only used for {@link #doOpenIfChanged(SegmentInfos, ExecutorService)} and
    * NRT replication
