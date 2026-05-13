@@ -39,6 +39,7 @@ import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -720,6 +721,163 @@ public class IndexWriter
       throw t;
     }
     onGetReaderMergeResources.close();
+    return r;
+  }
+
+
+  /**
+   * Same as {@link #getReader(boolean, boolean)} but with parallel segment reader initialization.
+   * The provided ExecutorService is used to open segment readers concurrently via
+   * {@link StandardDirectoryReader#openParallel(IndexWriter, SegmentInfos, boolean, boolean)}.
+   *
+   * <p>Replicates the full getReader logic: flush, apply deletes, point-in-time merges.
+   * Only the segment reader I/O is parallelized.
+   */
+  DirectoryReader getReaderParallel(boolean applyAllDeletes, boolean writeAllDeletes) throws IOException {
+    ensureOpen();
+    if (writeAllDeletes && applyAllDeletes == false) {
+      throw new IllegalArgumentException("applyAllDeletes must be true when writeAllDeletes=true");
+    }
+    final long tStart = System.currentTimeMillis();
+    if (infoStream.isEnabled("IW")) {
+      infoStream.message("IW", "flush at getReader (parallel)");
+    }
+    readerPool.enableReaderPooling();
+    StandardDirectoryReader r = null;
+    doBeforeFlush();
+    boolean anyChanges;
+    final long maxFullFlushMergeWaitMillis = config.getMaxFullFlushMergeWaitMillis();
+    MergePolicy.MergeSpecification onGetReaderMerges = null;
+    final AtomicBoolean stopCollectingMergedReaders = new AtomicBoolean(false);
+    final Map<String, SegmentReader> mergedReaders = new HashMap<>();
+    final Map<String, SegmentReader> openedReadOnlyClones = new HashMap<>();
+    // Sequential readerFactory for merge path (must hold writer lock)
+    IOFunction<SegmentCommitInfo, SegmentReader> readerFactory =
+        sci -> {
+          final ReadersAndUpdates rld = getPooledInstance(sci, true);
+          try {
+            assert Thread.holdsLock(IndexWriter.this);
+            SegmentReader segmentReader = rld.getReadOnlyClone(IOContext.DEFAULT);
+            if (maxFullFlushMergeWaitMillis > 0) {
+              openedReadOnlyClones.put(sci.info.name, segmentReader);
+            }
+            return segmentReader;
+          } finally {
+            release(rld);
+          }
+        };
+    Closeable onGetReaderMergeResources = null;
+    SegmentInfos openingSegmentInfos = null;
+    boolean success2 = false;
+    try {
+      boolean success = false;
+      synchronized (fullFlushLock) {
+        try {
+          anyChanges = docWriter.flushAllThreads() < 0;
+          if (anyChanges == false) {
+            flushCount.incrementAndGet();
+          }
+          publishFlushedSegments(true);
+          processEvents(false);
+          if (applyAllDeletes) {
+            applyAllDeletesAndUpdates();
+          }
+          synchronized (this) {
+            writeReaderPool(writeAllDeletes);
+            // Use parallel segment reader creation
+            r = StandardDirectoryReader.openParallel(
+                this, segmentInfos, applyAllDeletes, writeAllDeletes);
+            // Populate openedReadOnlyClones for finishGetReaderMerge/maybeReopenMergedNRTReader
+            if (maxFullFlushMergeWaitMillis > 0) {
+              for (LeafReaderContext ctx : r.leaves()) {
+                SegmentReader sr = (SegmentReader) ctx.reader();
+                openedReadOnlyClones.put(sr.getSegmentName(), sr);
+              }
+            }
+            if (infoStream.isEnabled("IW")) {
+              infoStream.message("IW", "return reader version=" + r.getVersion() + " reader=" + r);
+            }
+            if (maxFullFlushMergeWaitMillis > 0) {
+              openingSegmentInfos = r.getSegmentInfos().clone();
+              onGetReaderMerges =
+                  preparePointInTimeMerge(
+                      openingSegmentInfos,
+                      stopCollectingMergedReaders::get,
+                      MergeTrigger.GET_READER,
+                      sci -> {
+                        assert stopCollectingMergedReaders.get() == false;
+                        SegmentReader apply = readerFactory.apply(sci);
+                        mergedReaders.put(sci.info.name, apply);
+                        deleter.incRef(sci.files());
+                      });
+              onGetReaderMergeResources =
+                  () -> {
+                    synchronized (this) {
+                      stopCollectingMergedReaders.set(true);
+                      IOUtils.close(
+                          mergedReaders.values().stream()
+                              .map(sr -> (Closeable) () -> {
+                                try {
+                                  deleter.decRef(sr.getSegmentInfo().files());
+                                } finally {
+                                  sr.close();
+                                }
+                              })
+                              .toList());
+                    }
+                  };
+            }
+          }
+          success = true;
+        } finally {
+          assert Thread.holdsLock(fullFlushLock);
+          docWriter.finishFullFlush(success);
+          if (success) {
+            processEvents(false);
+            doAfterFlush();
+          } else {
+            if (infoStream.isEnabled("IW")) {
+              infoStream.message("IW", "hit exception during NRT reader");
+            }
+          }
+        }
+      }
+      if (onGetReaderMerges != null) {
+        StandardDirectoryReader mergedReader =
+            finishGetReaderMerge(
+                stopCollectingMergedReaders, mergedReaders, openedReadOnlyClones,
+                openingSegmentInfos, applyAllDeletes, writeAllDeletes,
+                onGetReaderMerges, maxFullFlushMergeWaitMillis);
+        if (mergedReader != null) {
+          try {
+            r.close();
+          } finally {
+            r = mergedReader;
+          }
+        }
+      }
+      anyChanges |= maybeMerge.getAndSet(false);
+      if (anyChanges) {
+        maybeMerge(config.getMergePolicy(), MergeTrigger.FULL_FLUSH, UNBOUNDED_MAX_MERGE_SEGMENTS);
+      }
+      if (infoStream.isEnabled("IW")) {
+        infoStream.message("IW", "getReader (parallel) took " + (System.currentTimeMillis() - tStart) + " ms");
+      }
+      success2 = true;
+    } catch (Error tragedy) {
+      tragicEvent(tragedy, "getReader");
+      throw tragedy;
+    } finally {
+      if (!success2) {
+        try {
+          IOUtils.closeWhileHandlingException(r, onGetReaderMergeResources);
+        } finally {
+          maybeCloseOnTragicEvent();
+        }
+      } else {
+        IOUtils.close(onGetReaderMergeResources);
+      }
+    }
     return r;
   }
 

@@ -143,6 +143,32 @@ public abstract class DirectoryReader extends BaseCompositeReader<LeafReader> {
       throws IOException {
     return writer.getReader(applyAllDeletes, writeAllDeletes);
   }
+  /**
+   * Expert: Returns a IndexReader reading all committed and uncommitted changes
+   * from the IndexWriter. Segment readers are opened in parallel using virtual threads.
+   *
+   * @param writer the IndexWriter to open from
+   * @throws IOException if there is a low-level IO error
+   * @lucene.experimental
+   */
+  public static DirectoryReader openParallel(IndexWriter writer) throws IOException {
+    return writer.getReaderParallel(true, false);
+  }
+
+  /**
+   * Expert: Returns a IndexReader reading all committed and uncommitted changes
+   * from the IndexWriter. Segment readers are opened in parallel using virtual threads.
+   *
+   * @param writer the IndexWriter to open from
+   * @param applyAllDeletes if true, all buffered deletes will be applied
+   * @param writeAllDeletes if true, new deletes will be written to disk
+   * @throws IOException if there is a low-level IO error
+   * @lucene.experimental
+   */
+  public static DirectoryReader openParallel(
+      IndexWriter writer, boolean applyAllDeletes, boolean writeAllDeletes) throws IOException {
+    return writer.getReaderParallel(applyAllDeletes, writeAllDeletes);
+  }
 
   /**
    * Expert: returns an IndexReader reading the index in the given {@link IndexCommit}.
