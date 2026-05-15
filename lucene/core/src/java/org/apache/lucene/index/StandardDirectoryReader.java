@@ -27,6 +27,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
@@ -110,7 +114,7 @@ public final class StandardDirectoryReader extends DirectoryReader {
     }.run(commit);
   }
 
-  /** Used by near real-time search */
+  /** Used by near real-time search. Opens segment readers in parallel using virtual threads. */
   static StandardDirectoryReader open(
       IndexWriter writer,
       IOFunction<SegmentCommitInfo, SegmentReader> readerFunction,
@@ -118,15 +122,159 @@ public final class StandardDirectoryReader extends DirectoryReader {
       boolean applyAllDeletes,
       boolean writeAllDeletes)
       throws IOException {
-    // IndexWriter synchronizes externally before calling
-    // us, which ensures infos will not change; so there's
-    // no need to process segments in reverse order
+    return open(writer, readerFunction, infos, applyAllDeletes, writeAllDeletes, true);
+  }
+
+  /** Internal open with control over concurrent initialization. */
+  static StandardDirectoryReader open(
+      IndexWriter writer,
+      IOFunction<SegmentCommitInfo, SegmentReader> readerFunction,
+      SegmentInfos infos,
+      boolean applyAllDeletes,
+      boolean writeAllDeletes,
+      boolean allowConcurrent)
+      throws IOException {
     final int numSegments = infos.size();
-
-    final List<SegmentReader> readers = new ArrayList<>(numSegments);
     final Directory dir = writer.getDirectory();
-
     final SegmentInfos segmentInfos = infos.clone();
+
+    if (!allowConcurrent || numSegments <= 1) {
+      return openSequential(writer, readerFunction, infos, segmentInfos, dir, numSegments, applyAllDeletes, writeAllDeletes);
+    }
+    return openConcurrent(writer, infos, segmentInfos, dir, numSegments, applyAllDeletes, writeAllDeletes);
+  }
+
+  /**
+   * Opens segment readers concurrently using virtual threads.
+   *
+   * <p>NOTE: We cannot call readerFunction.apply(info) from virtual threads because the lambda
+   * asserts Thread.holdsLock(IndexWriter.this) and calls release(rld) which also requires
+   * the writer lock. Instead, we split the readerFunction logic into phases:
+   * <ul>
+   *   <li>Phase 1 (main thread): getPooledInstance() — equivalent to readerFunction's first call</li>
+   *   <li>Phase 2 (virtual threads): getReadOnlyClone() — the expensive I/O, no lock needed</li>
+   *   <li>Phase 4 (main thread): release(rld) — equivalent to readerFunction's finally block</li>
+   * </ul>
+   *
+   * <p>CONTRACT: If readerFunction's logic changes (e.g., adds caching, metrics, or additional
+   * initialization), this method must be updated to maintain the same behavior.
+   * The openedReadOnlyClones population in IndexWriter.getReader() compensates for the
+   * map-put side-effect that readerFunction performs inside the lambda.
+   */
+  private static StandardDirectoryReader openConcurrent(
+      IndexWriter writer,
+      SegmentInfos infos,
+      SegmentInfos segmentInfos,
+      Directory dir,
+      int numSegments,
+      boolean applyAllDeletes,
+      boolean writeAllDeletes)
+      throws IOException {
+
+    final ReadersAndUpdates[] rlds = new ReadersAndUpdates[numSegments];
+    try {
+      for (int i = 0; i < numSegments; i++) {
+        final SegmentCommitInfo info = infos.info(i);
+        assert info.info.dir == dir;
+        rlds[i] = writer.getPooledInstance(info, true);
+      }
+    } catch (Throwable t) {
+      for (int j = 0; j < numSegments; j++) {
+        if (rlds[j] != null) {
+          try { writer.release(rlds[j]); } catch (Throwable t2) { t.addSuppressed(t2); }
+        }
+      }
+      if (t instanceof IOException ioEx) { throw ioEx; }
+      if (t instanceof RuntimeException re) { throw re; }
+      throw new RuntimeException(t);
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    final Future<SegmentReader>[] futures = new Future[numSegments];
+    ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    for (int i = 0; i < numSegments; i++) {
+      final ReadersAndUpdates rld = rlds[i];
+      futures[i] = executor.submit(() -> rld.getReadOnlyClone(IOContext.DEFAULT));
+    }
+    executor.shutdown();
+
+    final SegmentReader[] readers = new SegmentReader[numSegments];
+    RuntimeException firstException = null;
+    boolean interrupted = false;
+    for (int i = 0; i < numSegments; i++) {
+      try {
+        while (true) {
+          try { readers[i] = futures[i].get(); break; }
+          catch (InterruptedException e) { interrupted = true; }
+        }
+      } catch (ExecutionException e) {
+        if (firstException == null) { firstException = new RuntimeException(e.getCause()); }
+        else { firstException.addSuppressed(e.getCause()); }
+      }
+    }
+    if (interrupted) { Thread.currentThread().interrupt(); }
+
+    for (int i = 0; i < numSegments; i++) {
+      if (rlds[i] != null) {
+        try { writer.release(rlds[i]); }
+        catch (Throwable t) {
+          if (firstException == null) { firstException = new RuntimeException(t); }
+          else { firstException.addSuppressed(t); }
+        }
+      }
+    }
+
+    if (firstException != null) {
+      for (SegmentReader reader : readers) {
+        if (reader != null) {
+          try { reader.decRef(); } catch (Throwable t) { firstException.addSuppressed(t); }
+        }
+      }
+      if (firstException.getCause() instanceof IOException ioEx) {
+        for (Throwable s : firstException.getSuppressed()) { ioEx.addSuppressed(s); }
+        throw ioEx;
+      }
+      throw firstException;
+    }
+
+    final List<SegmentReader> validReaders = new ArrayList<>(numSegments);
+    int infosUpto = 0;
+    try {
+      for (int i = 0; i < numSegments; i++) {
+        final SegmentReader reader = readers[i];
+        if (reader.numDocs() > 0
+            || writer.getConfig().mergePolicy.keepFullyDeletedSegment(() -> reader)) {
+          validReaders.add(reader);
+          infosUpto++;
+        } else {
+          readers[i] = null;
+          reader.decRef();
+          segmentInfos.remove(infosUpto);
+        }
+      }
+      writer.incRefDeleter(segmentInfos);
+      return new StandardDirectoryReader(dir, validReaders.toArray(new SegmentReader[0]),
+          writer, segmentInfos, writer.getConfig().getLeafSorter(), applyAllDeletes, writeAllDeletes);
+    } catch (Throwable t) {
+      for (SegmentReader reader : readers) {
+        if (reader != null) { try { reader.decRef(); } catch (Throwable t2) { t.addSuppressed(t2); } }
+      }
+      if (t instanceof IOException) { throw (IOException) t; }
+      throw new RuntimeException(t);
+    }
+  }
+
+  private static StandardDirectoryReader openSequential(
+      IndexWriter writer,
+      IOFunction<SegmentCommitInfo, SegmentReader> readerFunction,
+      SegmentInfos infos,
+      SegmentInfos segmentInfos,
+      Directory dir,
+      int numSegments,
+      boolean applyAllDeletes,
+      boolean writeAllDeletes)
+      throws IOException {
+    final List<SegmentReader> readers = new ArrayList<>(numSegments);
     int infosUpto = 0;
     try {
       for (int i = 0; i < numSegments; i++) {

@@ -538,6 +538,9 @@ public class IndexWriter
     final Map<String, SegmentReader> openedReadOnlyClones = new HashMap<>();
     // this function is used to control which SR are opened in order to keep track of them
     // and to reuse them in the case we wait for merges in this getReader call.
+    // CONTRACT: The parallel path in StandardDirectoryReader.openConcurrent() replicates this
+    // logic using phase separation (getPooledInstance/getReadOnlyClone/release). If this
+    // readerFactory logic changes, openConcurrent() must be updated to match.
     IOFunction<SegmentCommitInfo, SegmentReader> readerFactory =
         sci -> {
           final ReadersAndUpdates rld = getPooledInstance(sci, true);
@@ -607,6 +610,13 @@ public class IndexWriter
             r =
                 StandardDirectoryReader.open(
                     this, readerFactory, segmentInfos, applyAllDeletes, writeAllDeletes);
+            // Populate openedReadOnlyClones since parallel path bypasses readerFactory
+            if (maxFullFlushMergeWaitMillis > 0 && segmentInfos.size() > 1) {
+              for (LeafReaderContext ctx : r.leaves()) {
+                SegmentReader sr = (SegmentReader) ctx.reader();
+                openedReadOnlyClones.put(sr.getSegmentName(), sr);
+              }
+            }
             if (infoStream.isEnabled("IW")) {
               infoStream.message("IW", "return reader version=" + r.getVersion() + " reader=" + r);
             }
@@ -785,7 +795,8 @@ public class IndexWriter
             },
             openingSegmentInfos,
             applyAllDeletes,
-            writeAllDeletes);
+            writeAllDeletes,
+            false);
       } finally {
         // now the SDR#open call has incRef'd the files so we can let them go
         deleter.decRef(files);
